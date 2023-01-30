@@ -1,0 +1,628 @@
+---
+title: "Supplementary Material S2: Case study for \"A theoretical framework for upscaling species distribution models\""
+author: Christine N. Meynard, Cyril Piou, David M. Kaplan
+
+# Uncomment the two lines below if you want to add citations
+#bibliography: "supplementary-s1-theory.bib"
+#csl: dmk-format.csl
+
+output:
+  bookdown::pdf_document2:
+    df_print: kable
+    toc: true
+    toc_depth: 3
+    keep_tex: true
+
+always_allow_html: true
+urlcolor: blue
+linkcolor: blue
+
+# Basic parameters for model
+params:
+  predictor.files: !r c(PC1="rawData/PC1.grd",PC2="rawData/PC2.grd")
+  occurrence.file: "rawData/surveyed.grd"
+  split.frac: 0.8
+  num.splits: 5
+  models: !r c(gam="gam",rf="rf",gbm="gbm",maxent="maxent",lasso="lasso")
+  gam_k: 4
+  scales: !r seq(1,20,2)
+  ts: !r format(Sys.time(),format="%Y%m%dT%H%M%S")
+  # For running code in parallel
+  ncpus: 4 # Only used if ncpus environmental variable not present
+
+# These are LaTex settings to take care of floating figures/tables, line spacing, etc
+header-includes:
+  - \usepackage[nomarkers,tablesfirst]{endfloat}    
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{lineno}
+  - \linenumbers
+  - \usepackage{tocloft}
+  - \setlength{\cftsecnumwidth}{3em}
+  - \setlength{\cftsubsecnumwidth}{3em}
+  - \setlength{\cftsubsubsecnumwidth}{4em}
+---
+
+<!-- For Latex section, figure and table numbering -->
+\renewcommand\thesection{S2.\arabic{section}}
+\renewcommand\thefigure{S2.\arabic{figure}}
+\renewcommand\thetable{S2.\arabic{table}}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.pos = 'p') # Places figures on their own pages
+knitr::opts_chunk$set(out.width = '100%', dpi=300)
+
+# More memory for Java
+options(java.parameters = "-Xmx2g" )
+dir.create("results",showWarnings = FALSE)
+
+library(tidyverse)
+library(mgcv)
+library(stars)
+library(Matrix)
+library(dismo)
+library(randomForest)
+library(ecospat)
+library(foreach)
+```
+
+
+# Load base data
+
+```{r loadbasedata,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+predictors = names(params$predictor.files)
+pred_stars = do.call("c",lapply(params$predictor.files,read_stars))
+names(pred_stars) = predictors
+
+occ_stars = read_stars(params$occurrence.file)
+names(occ_stars) = "occurrence"
+
+# CHOOSE ONE OF THE TWO APPROACHES BELOW !!!
+
+# # Warp the predictors to the occurrence data
+# base_data = st_warp(pred_stars,occ_stars)
+# base_data = c(base_data,occ_stars)
+
+# Warp the occurrence data to the predictors
+base_data = st_warp(occ_stars,pred_stars)
+base_data = c(pred_stars,base_data)
+
+```
+
+## Do downscaling (coarser resolutions)
+
+```{r downscaling,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+# Function for doing aggregation
+aggregate_fact = function(r,fact,method,no_data_value=-999) {
+  if (length(fact)==1) fact = c(fact,fact)
+  cellsize = fact * c(st_dimensions(r)$x$delta,st_dimensions(r)$y$delta)
+  rr = lapply(names(r), function(n) {
+    st_warp(r[n],cellsize=cellsize,use_gdal=TRUE,no_data_value=no_data_value,method=method)
+    })
+  rr = do.call("c",rr)
+  names(rr) = names(r)
+  return(rr)
+}
+
+# Create aggregates
+scales = params$scales
+names(scales) = scales
+
+base_data.aggs = scales |>
+  lapply(FUN=function(fact) {
+    occ = aggregate_fact(base_data["occurrence"],fact=fact,method="max")
+    pp = aggregate_fact(base_data[predictors],fact=fact,method="average")
+    return(c(pp,occ))
+  })
+
+```
+
+## Create data frames
+
+```{r asdataframe,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+base_data.aggs.df = base_data.aggs |>
+  lapply(FUN=function(d) {
+    d = as.data.frame(d)
+    d[apply(d,1,FUN=function(x) !any(is.na(x))),]
+  })
+```
+
+
+## Pre-calculate splits of the data
+
+```{r splits,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+# Create the set of all splits we need
+splits = expand.grid(scale=as.character(scales),split=1:params$num.splits,
+                     stringsAsFactors = FALSE)
+
+nrows_df = sapply(base_data.aggs.df,nrow)
+
+splits.lines = lapply(1:nrow(splits),function(n) 
+  sample(1:nrows_df[splits$scale[n]],round(nrows_df[splits$scale[n]]*params$split.frac),
+         replace=FALSE))
+```
+
+## Save base data
+
+```{r savebasedata,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+ts = params$ts
+save(predictors,base_data,base_data.aggs,base_data.aggs.df,splits,splits.lines,ts,scales,
+     file="results/supplementary-s2-case-study.base-data.RData")
+```
+
+```{r load_base_data_from_rdata}
+load("results/supplementary-s2-case-study.base-data.RData")
+```
+
+
+# Creat list of models to run
+
+```{r models_to_run,eval=!file.exists("results/supplementary-s2-case-study.models_to_run.RDS")}
+models_to_run = expand.grid(scale=as.character(scales),split=1:params$num.splits,
+                   model=params$models,
+                   stringsAsFactors = FALSE)
+
+models_to_run$filename = 
+  paste0("results/supplementary-s2-case-study",
+         ".scale_",sprintf("%02d",as.integer(models_to_run$scale)),
+         ".split_",sprintf("%02d",models_to_run$split),
+         ".model_",models_to_run$model,
+         ".RDS")
+
+saveRDS(models_to_run,"results/supplementary-s2-case-study.models_to_run.RDS")
+```
+
+```{r load_models_to_run_find_new}
+models_to_run = readRDS("results/supplementary-s2-case-study.models_to_run.RDS")
+
+new_mods = models_to_run[!file.exists(models_to_run$filename),]
+```
+
+# Run models
+
+## Helper functions from Valavi paper
+
+```{r prediction_helper}
+#Notice that this part (make_quadratic, predict.make_quadratic and maxent_param below) comes from Valavi et al 2022 in Ecological Monograph
+
+#' Orthogonal quadratic polynomials for glmnet
+#'
+#' A function to create quadratic terms for glmnet functions i.e. lasso and ridge regression.
+#' The output is an object of make_quadratic that can be used to predict on rasters and data.frames
+#' for creating the quadratic terms.
+#'
+#' @param df a data.frame, typically the training data.
+#' @param cols the name or index of the columns to be transformed. If NULL, all the columns will be transformed.
+#' The factor columns won't be transfromed.
+#'
+#' @author Roozbeh Valavi
+#'
+#' @return an object of make_quadratic that can be used to predict on rasters and data.frames
+#' @export
+#'
+#' @examples
+make_quadratic <- function(df, cols = NULL, verbose = TRUE){
+  if(is.null(cols)){
+    cols <- colnames(df)
+  }
+  if(is.numeric(cols)){
+    cols <- colnames(df)[cols]
+  }
+  # remove the factors
+  if(any(sapply(df[,cols], is.factor))){
+    if(verbose){
+      message("The factor columns were removed form cols: ", cols[which(sapply(df[,cols], is.factor))])
+    }
+    cols <- cols[-which(sapply(df[,cols], is.factor))]
+  }
+  if(!all(is.element(cols, colnames(df)))){
+    stop("The cols should be the same as the column names.")
+  }
+  xbar <- apply(df[,cols], 2, mean)
+  x1 <- data.frame(mapply(`-`, df[,cols], xbar, SIMPLIFY = FALSE))
+  alpha <- colSums(x1 ^ 3) / colSums(x1 ^ 2)
+  # specify the output class
+  finalList <- list(names = cols, xbars = xbar, alphas = alpha)
+  class(finalList) <- c("make_quadratic")
+  return(finalList)
+}
+
+
+#' @export
+#' @method predict make_quadratic
+predict.make_quadratic <- function(object, newdata, ...){
+  if(!methods::is(object, "make_quadratic"))
+    stop("object should be a make_quadratic object.")
+  if(!all(object$names %in% names(newdata)))
+    stop("The newdata does not have the same names as the object.")
+  ncl <- object$names
+  if(methods::is(newdata, "Raster")){
+    for(i in ncl){
+      x1 <- newdata[[i]] - object$xbars[i]
+      x2 <- (x1 ^ 2) - (object$alphas[i] * x1)
+      if(raster::nlayers(newdata) > 1){
+        newdata <- newdata[[-which(names(newdata) == i)]]
+        newdata <- raster::stack(newdata, x1)
+      } else{
+        newdata <- x1
+      }
+      names(newdata)[raster::nlayers(newdata)] <- paste0(i, "_1")
+      newdata <- raster::stack(newdata, x2)
+      names(newdata)[raster::nlayers(newdata)] <- paste0(i, "_2")
+    }
+  } else if(methods::is(newdata, "data.frame")){
+    for(i in ncl){
+      x1 <- newdata[,i] - object$xbars[i]
+      x2 <- x1 ^ 2 - object$alphas[i] * x1
+      newdata <- newdata[,-which(names(newdata) == i),drop=FALSE]
+      newdata[,ncol(newdata) + 1] <- x1
+      names(newdata)[ncol(newdata)] <- paste0(i, "_1")
+      newdata[,ncol(newdata) + 1] <- x2
+      names(newdata)[ncol(newdata)] <- paste0(i, "_2")
+    }
+  } else stop("newdata should be a raster or a data.frame.")
+  return(newdata)
+}
+
+
+# function for simultaneous tuning maxent regularisation multiplier and features
+maxent_param <- function(data, y = "occ", k = 5, folds = NULL, filepath){
+  require(dismo)
+  require(caret)
+  require(precrec)
+  
+  names(data)[which(names(data) == y)] <- "occ" # DMK: I moved this line up for folds calculation
+  
+  if(is.null(folds)){
+    # generate balanced CV folds
+    folds <- caret::createFolds(y = as.factor(data$occ), k = k)
+  }
+  covars <- names(data)[which(names(data) != y)]
+  # regularisation multipliers
+  ms <- c(0.5, 1, 2, 3, 4)
+  grid <- expand.grid(
+    regmult = paste0("betamultiplier=", ms),
+    features = list(
+      c("noautofeature", "nothreshold"), # LQHP
+      c("noautofeature", "nothreshold", "noproduct"), # LQH
+      c("noautofeature", "nothreshold", "nohinge", "noproduct"), # LQ
+      c("noautofeature", "nothreshold", "nolinear", "noquadratic", "noproduct"), # H
+      c("noautofeature", "nothreshold", "noquadratic", "nohinge", "noproduct")), # L
+    stringsAsFactors = FALSE
+    )
+  AUCs <- c()
+  for(n in seq_along(grid[,1])){
+    full_pred <- data.frame()
+    for(i in seq_len(length(folds))){
+      trainSet <- unlist(folds[-i])
+      testSet <- unlist(folds[i])
+      if(inherits(try(
+        maxmod <- dismo::maxent(x = data[trainSet, covars],
+                                p = data$occ[trainSet],
+                                removeDuplicates = FALSE,
+                                path = filepath,
+                                args = as.character(unlist(grid[n, ]))
+        )
+      ), "try-error")){
+        next
+      }
+      modpred <- predict(maxmod, data[testSet, covars], args = "outputformat=cloglog")
+      pred_df <- data.frame(score = modpred, label = data$occ[testSet])
+      full_pred <- rbind(full_pred, pred_df)
+    }
+    AUCs[n] <- precrec::auc(precrec::evalmod(scores = full_pred$score, 
+                                             labels = full_pred$label))[1,4]
+  }
+  best_param <- as.character(unlist(grid[which.max(AUCs), ]))
+  return(best_param)
+}
+
+
+# for easy saving the parameters
+param_to_txt <- function(x){
+  x <- x[-(1:3)]
+  if(length(x) == 0){
+    features <- "LQHP"
+  } else if(all(c("noquadratic", "nohinge", "noproduct") %in% x)){
+    features <- "L"
+  } else if(all(c("nolinear", "noquadratic", "noproduct") %in% x)){
+    features <- "H"
+  } else if(all(c("nohinge", "noproduct") %in% x)){
+    features <- "LQ"
+  } else if("noproduct" == x){
+    features <- "LQH"
+  }
+  return(features)
+}
+
+```
+
+
+## Functions to fit models
+
+```{r modfuns}
+run_model_gam = function(df,lines,predictors,k=params$gam_k) {
+  moddata=df[lines,]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  # Create formula
+  ff = paste0("s(",predictors,",k=",k,")",collapse="+")
+  ff = as.formula(paste0("occurrence~",ff))
+
+  mod1 = mgcv::gam(ff, family="binomial", data=moddata, weights = w50)
+  
+  return(mod1)
+}
+
+run_model_lasso = function(df,lines,predictors) {
+  moddata=df[lines,]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  moddata=moddata[,c(predictors,"occurrence","w50")]
+
+  #Quadratic terms
+  # function to create quadratic terms for lasso and ridge
+  quad_obj <- make_quadratic(moddata, cols = predictors)
+
+  # this make two columns for each covariates used in the transformation
+  training_quad <- predict.make_quadratic(quad_obj, newdata = moddata[,predictors])
+
+  # convert the data.frames to sparse matrices
+  training_sparse <- Matrix::sparse.model.matrix(~. -1, training_quad)#requires library Matrix
+
+  #Fitting the lasso model:
+  lassomod <- glmnet::cv.glmnet(x = training_sparse,
+                                y = moddata$occurrence, family = "binomial",
+                                alpha = 1, weights = moddata$w50, standardize = TRUE)
+
+  return(list(quad_obj=quad_obj,lassomod=lassomod))
+}
+
+run_model_maxent = function(df,lines,predictors) {
+  moddata=df[lines,c(predictors,"occurrence")]
+    
+  nfold = ifelse(sum(moddata$occurrence) < 10, 2, 5)
+  
+  moddata$occurrence = as.factor(moddata$occurrence)
+
+  fp = tempfile("results/maxent.outputs.",tmpdir=".")
+  param_optim = maxent_param(data = moddata, y="occurrence",
+                             k = nfold,
+                             filepath = fp)
+
+  mod_maxent = dismo::maxent(x = moddata[,predictors],
+                             p = moddata$occurrence,
+                             removeDuplicates = FALSE,
+                             path = fp,
+                             args = param_optim
+  )
+
+  gc()
+  
+  return(mod_maxent)
+}
+
+run_model_rf = function(df,lines,predictors) {
+  moddata=df[lines,c(predictors,"occurrence")]
+  moddata$occurrence = as.factor(moddata$occurrence)
+
+  samsize = table(moddata$occurrence)
+  n = names(samsize)
+  samsize = as.numeric(samsize)
+  names(samsize) = n
+  
+  #calibrate the RF model
+  mod_rf <- randomForest::randomForest(occurrence ~ ., 
+                         data = moddata,
+                         ntree = 1000,
+                         sampsize = samsize,
+                         replace = TRUE)
+
+  return(mod_rf)
+}
+
+run_model_gbm = function(df,lines,predictors) {
+  moddata=df[lines,c(predictors,"occurrence")]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  mod_gbm = dismo::gbm.step(data = moddata,
+                            gbm.x = predictors,
+                            gbm.y = "occurrence", 
+                            family = "bernoulli",
+                            site.weights = moddata$w50,
+                            tree.complexity = 5,
+                            learning.rate = 0.001,
+                            n.trees = 50,
+                            n.folds = 4,
+                            max.trees = 10000,
+                            plot.main=FALSE) # DMK: I turned off automatic plotting...
+  
+  return(mod_gbm)
+}
+
+```
+
+
+## Functions to predict models
+
+```{r predictfuns}
+predict_model_gam = function(model,df,lines,bd,predictors) {
+  library(stars)
+  bdf = as.data.frame(bd)
+  pp = predict(model,bdf,type="response")
+  
+  bd$predgam = as.numeric(pp)
+
+  return(bd["predgam"])
+}
+
+predict_model_lasso = function(model,df,lines,bd,predictors) {
+  library(stars)
+  bdf = as.data.frame(bd)[,predictors]
+  bdf_quad <- predict.make_quadratic(model$quad_obj, newdata = bdf)
+  bdf_sparse <- Matrix::sparse.model.matrix( ~. -1, bdf_quad)
+
+  pp = predict(model$lassomod,newx=bdf_sparse,type="response",s="lambda.min")
+  # predict.glmnet excludes NA's...
+
+  I = apply(bdf,1,function(x)!any(is.na(x)))
+  bd$predlasso = NA
+  bd$predlasso[I] = as.numeric(pp)
+
+  return(bd["predlasso"])
+}
+
+predict_model_maxent = function(model,df,lines,bd,predictors) {
+  library(stars)
+  bdf = as.data.frame(bd)[,predictors]
+
+  pp = predict(model,bdf)
+  # predict.MaxEnt excludes NA's...
+
+  I = apply(bdf,1,function(x)!any(is.na(x)))
+  bd$predmaxent = NA
+  bd$predmaxent[I] = as.numeric(pp)
+
+  return(bd["predmaxent"])
+}
+
+predict_model_rf = function(model,df,lines,bd,predictors) {
+  library(stars)
+  bdf = as.data.frame(bd)[,predictors]
+
+  pp = predict(model,bdf,type="prob") # DMK: Predicts for all data, but has 2 columns for prob =0, prob =1
+  bd$predrf = pp[,"1"]
+
+  return(bd["predrf"])
+}
+
+predict_model_gbm = function(model,df,lines,bd,predictors) {
+  library(stars)
+  predgbm = predict(bd[predictors],model,n.trees=model$gbm.call$best.trees,type="response")
+  names(predgbm) = "predgbm"
+  
+  return(predgbm)
+}
+
+```
+
+
+## Execute models
+
+```{r exec_models,eval=nrow(new_mods)>0}
+#### NOTES FOR RUNNING MODELS ####
+# When running models, it is best to knit script outside of RStudio as RStudio and %dopar%
+# have a tendency to not play nicely together. In this case, it is best to run R in a
+# terminal and execute the script with `rmarkdown::render("supplementary-s2-case-study.Rmd")
+
+# Get all environment variables
+ev=as.list(Sys.getenv())
+
+if (is.null(ev$NCPUS)) ncpus=params$ncpus else ncpus=ev$NCPUS
+
+# Create computing cluster
+library(foreach)
+library(doParallel)
+cl <- makeCluster(ncpus)
+registerDoParallel(cl)
+
+# Exec models
+res = foreach(n=1:nrow(new_mods),.export=c("params",lsf.str())) %dopar% {
+  sc = as.character(new_mods$scale[n])
+  sp = new_mods$split[n]
+  mm = new_mods$model[n]
+  fn = new_mods$filename[n]
+  
+  mod_fn = paste0("run_model_",mm)
+  pred_fn = paste0("predict_model_",mm)
+  
+  spn = which(splits$scale==sc & splits$split==sp)
+  lines = splits.lines[[spn]]
+  
+  bd = base_data.aggs[[sc]]
+  df = base_data.aggs.df[[sc]]
+
+  model = do.call(mod_fn,list(df=df,lines=lines,predictors=predictors))
+  preds = do.call(pred_fn,list(model=model,df=df,lines=lines,bd=bd,predictors=predictors))
+  
+  saveRDS(list(scale=sc,split=sp,model_type=mm,lines=lines,model=model,predictions=preds,
+               predictors=predictors),
+          file=fn)
+  fn
+}
+```
+
+# Ensemble mean and performance statistics
+
+```{r ensemble,eval=!file.exists("results/supplementary-s2-case-study.model_stats.RDS")}
+mm = unique(models_to_run[c("scale","split")])
+nn = 1:nrow(mm)
+names(nn) = paste0("scale_",mm$scale,".split_",mm$split)
+model_stats = foreach(n=nn) %do% {
+  sc = as.character(mm$scale[n])
+  sp = mm$split[n]
+  
+  N = which(splits$scale == sc & splits$split == sp)
+  lines = splits.lines[[N]]
+  
+  MM = filter(models_to_run,scale==sc,split==sp)
+  
+  num_mods = nrow(MM)
+
+  res = readRDS(MM$filename[1])
+  ee = res$predictions
+  names(ee) = "predensemble"
+  
+  for (ii in 2:num_mods) {
+    res = readRDS(MM$filename[ii])
+    ee = ee + res$predictions
+  }
+  
+  ee = ee/num_mods
+  
+  nfn = gsub("model_.*.RDS$","model_ensemble.RDS",MM$filename[1])
+  res$model = "ENSEMBLE AVERAGE"
+  res$predictions = ee
+  saveRDS(res,nfn)
+  
+  # Stats
+  df = base_data.aggs.df[[sc]][-lines,"occurrence",drop=FALSE]
+  names(df) = "obs"
+  
+  I = apply(as.data.frame(base_data.aggs[[sc]]),1,FUN=function(x) !any(is.na(x)))
+  df$pred = ee[[1]][I][-lines]
+  
+  # Add ID column
+  df$id = 1:nrow(df)
+  
+  # Reorder as needed by PresenceAbsence
+  df = df[,c("id","obs","pred")]
+    
+  aa = PresenceAbsence::auc(df)
+  th = PresenceAbsence::optimal.thresholds(df, opt.methods=3)
+  acc = PresenceAbsence::presence.absence.accuracy(df,th[[2]])
+  fit=df$pred
+  obs=df$pred[df$obs==1]
+  c.stat=ecospat::ecospat.boyce(fit,obs, PEplot = FALSE)
+
+  list(scale=sc,split=sp,auc=aa,threshold=th,accuracy=acc,c.stat.boyce=c.stat)
+}
+
+names(model_stats) = names(nn)
+
+saveRDS(model_stats,"results/supplementary-s2-case-study.model_stats.RDS")
+```
+
+```{r load_saved_stats}
+model_stats = readRDS("results/supplementary-s2-case-study.model_stats.RDS")
+```
+
