@@ -1,6 +1,6 @@
 ---
 title: "Supplementary Material S2: Case study for \"A theoretical framework for upscaling species distribution models\""
-author: Christine N. Meynard, Cyril Piou, David M. Kaplan
+author: Christine N. Meynard, Fanny Herbillon, Cyril Piou, David M. Kaplan
 
 # Uncomment the two lines below if you want to add citations
 #bibliography: "supplementary-s1-theory.bib"
@@ -17,7 +17,7 @@ always_allow_html: true
 urlcolor: blue
 linkcolor: blue
 
-# Basic parameters for model
+##### Basic parameters for model #####
 params:
   predictor.files: !r c(PC1="rawData/PC1.grd",PC2="rawData/PC2.grd")
   occurrence.file: "rawData/surveyed.grd"
@@ -29,6 +29,7 @@ params:
   ts: !r format(Sys.time(),format="%Y%m%dT%H%M%S")
   # For running code in parallel
   ncpus: 4 # Only used if ncpus environmental variable not present
+  n.pts: 200 # Number of points to use when estimating effect of each predictor
 
 # These are LaTex settings to take care of floating figures/tables, line spacing, etc
 header-includes:
@@ -61,8 +62,11 @@ library(mgcv)
 library(stars)
 library(Matrix)
 library(dismo)
+library(gbm)
+library(glmnet)
 library(randomForest)
-library(ecospat)
+#library(PresenceAbsence) # DMK: Functions here are hidden by other packages. Better to not load it and explicitly call these functions with package name.
+library (ecospat)
 library(foreach)
 ```
 
@@ -77,7 +81,7 @@ names(pred_stars) = predictors
 occ_stars = read_stars(params$occurrence.file)
 names(occ_stars) = "occurrence"
 
-# CHOOSE ONE OF THE TWO APPROACHES BELOW !!!
+#### CHOOSE ONE OF THE TWO APPROACHES BELOW !!! ####
 
 # # Warp the predictors to the occurrence data
 # base_data = st_warp(pred_stars,occ_stars)
@@ -89,10 +93,12 @@ base_data = c(pred_stars,base_data)
 
 ```
 
-## Do downscaling (coarser resolutions)
+## Do downscaling
 
 ```{r downscaling,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
 # Function for doing aggregation
+# Based on GDAL methods in `st_warp`. This can do a limited number of aggregation
+# functions and it always seems to operate as if one chose `na.rm=TRUE`.
 aggregate_fact = function(r,fact,method,no_data_value=-999) {
   if (length(fact)==1) fact = c(fact,fact)
   cellsize = fact * c(st_dimensions(r)$x$delta,st_dimensions(r)$y$delta)
@@ -122,8 +128,8 @@ base_data.aggs = scales |>
 ```{r asdataframe,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
 base_data.aggs.df = base_data.aggs |>
   lapply(FUN=function(d) {
-    d = as.data.frame(d)
-    d[apply(d,1,FUN=function(x) !any(is.na(x))),]
+    d = as.data.frame(d) # Convert to data frame
+    d[apply(d,1,FUN=function(x) !any(is.na(x))),] # remove NA's
   })
 ```
 
@@ -137,6 +143,7 @@ splits = expand.grid(scale=as.character(scales),split=1:params$num.splits,
 
 nrows_df = sapply(base_data.aggs.df,nrow)
 
+# Variables containing rows to include for each combination of scale and split iteration
 splits.lines = lapply(1:nrow(splits),function(n) 
   sample(1:nrows_df[splits$scale[n]],round(nrows_df[splits$scale[n]]*params$split.frac),
          replace=FALSE))
@@ -158,6 +165,7 @@ load("results/supplementary-s2-case-study.base-data.RData")
 # Creat list of models to run
 
 ```{r models_to_run,eval=!file.exists("results/supplementary-s2-case-study.models_to_run.RDS")}
+# Create list of all models we will use
 models_to_run = expand.grid(scale=as.character(scales),split=1:params$num.splits,
                    model=params$models,
                    stringsAsFactors = FALSE)
@@ -175,6 +183,7 @@ saveRDS(models_to_run,"results/supplementary-s2-case-study.models_to_run.RDS")
 ```{r load_models_to_run_find_new}
 models_to_run = readRDS("results/supplementary-s2-case-study.models_to_run.RDS")
 
+# Just a list of models that have not yet been run
 new_mods = models_to_run[!file.exists(models_to_run$filename),]
 ```
 
@@ -183,11 +192,13 @@ new_mods = models_to_run[!file.exists(models_to_run$filename),]
 ## Helper functions from Valavi paper
 
 ```{r prediction_helper}
-#Notice that this part (make_quadratic, predict.make_quadratic and maxent_param below) comes from Valavi et al 2022 in Ecological Monograph
+# Notice that this script comes from Valavi et al 2022 in Ecological Monograph
+# It has a few *minor modifications and corrections* with respect to what appeared
+# in the paper.
 
 #' Orthogonal quadratic polynomials for glmnet
 #'
-#' A function to create quadratic terms for glmnet functions i.e. lasso and ridge regression.
+#' A function to creat quadratic terms for glmnet functions i.e. lasso and ridge regression.
 #' The output is an object of make_quadratic that can be used to predict on rasters and data.frames
 #' for creating the quadratic terms.
 #'
@@ -341,6 +352,9 @@ param_to_txt <- function(x){
 ## Functions to fit models
 
 ```{r modfuns}
+
+# One function per model type. All functions must have df, lines and predictors arguments.
+
 run_model_gam = function(df,lines,predictors,k=params$gam_k) {
   moddata=df[lines,]
   
@@ -381,25 +395,27 @@ run_model_lasso = function(df,lines,predictors) {
                                 y = moddata$occurrence, family = "binomial",
                                 alpha = 1, weights = moddata$w50, standardize = TRUE)
 
-  return(list(quad_obj=quad_obj,lassomod=lassomod))
+  mod = list(quad_obj=quad_obj,lassomod=lassomod)
+  class(mod) = "quad_lasso"
+  return(mod)
 }
 
-run_model_maxent = function(df,lines,predictors) {
+run_model_maxent = function(df,lines,predictors,
+                            filepath=tempfile("results/maxent.outputs.",tmpdir=".")) {
   moddata=df[lines,c(predictors,"occurrence")]
     
   nfold = ifelse(sum(moddata$occurrence) < 10, 2, 5)
   
   moddata$occurrence = as.factor(moddata$occurrence)
 
-  fp = tempfile("results/maxent.outputs.",tmpdir=".")
   param_optim = maxent_param(data = moddata, y="occurrence",
                              k = nfold,
-                             filepath = fp)
+                             filepath = filepath)
 
   mod_maxent = dismo::maxent(x = moddata[,predictors],
                              p = moddata$occurrence,
                              removeDuplicates = FALSE,
-                             path = fp,
+                             path = filepath,
                              args = param_optim
   )
 
@@ -455,64 +471,66 @@ run_model_gbm = function(df,lines,predictors) {
 ## Functions to predict models
 
 ```{r predictfuns}
-predict_model_gam = function(model,df,lines,bd,predictors) {
-  library(stars)
-  bdf = as.data.frame(bd)
-  pp = predict(model,bdf,type="response")
+predict_model = function(model,bd,predictors) {
+  # Determine model type based on class of model
+  mt = c(gam="gam",randomForest.formula="rf",gbm="gbm",MaxEnt="maxent",list="lasso",
+         quad_lasso="lasso")[class(model)[1]]
   
-  bd$predgam = as.numeric(pp)
-
-  return(bd["predgam"])
-}
-
-predict_model_lasso = function(model,df,lines,bd,predictors) {
-  library(stars)
-  bdf = as.data.frame(bd)[,predictors]
-  bdf_quad <- predict.make_quadratic(model$quad_obj, newdata = bdf)
-  bdf_sparse <- Matrix::sparse.model.matrix( ~. -1, bdf_quad)
-
-  pp = predict(model$lassomod,newx=bdf_sparse,type="response",s="lambda.min")
-  # predict.glmnet excludes NA's...
-
-  I = apply(bdf,1,function(x)!any(is.na(x)))
-  bd$predlasso = NA
-  bd$predlasso[I] = as.numeric(pp)
-
-  return(bd["predlasso"])
-}
-
-predict_model_maxent = function(model,df,lines,bd,predictors) {
-  library(stars)
-  bdf = as.data.frame(bd)[,predictors]
-
-  pp = predict(model,bdf)
-  # predict.MaxEnt excludes NA's...
-
-  I = apply(bdf,1,function(x)!any(is.na(x)))
-  bd$predmaxent = NA
-  bd$predmaxent[I] = as.numeric(pp)
-
-  return(bd["predmaxent"])
-}
-
-predict_model_rf = function(model,df,lines,bd,predictors) {
-  library(stars)
-  bdf = as.data.frame(bd)[,predictors]
-
-  pp = predict(model,bdf,type="prob") # DMK: Predicts for all data, but has 2 columns for prob =0, prob =1
-  bd$predrf = pp[,"1"]
-
-  return(bd["predrf"])
-}
-
-predict_model_gbm = function(model,df,lines,bd,predictors) {
-  library(stars)
-  predgbm = predict(bd[predictors],model,n.trees=model$gbm.call$best.trees,type="response")
-  names(predgbm) = "predgbm"
+  # If stars object recall with data.frame, put in stars object and return
+  if (isa(bd,"stars")) {
+    require(stars)
+    pp = predict_model(model=model,bd=as.data.frame(bd),predictors=predictors)
+    pn = paste0("pred",mt)
+    bd[[pn]] = pp
+    return(bd[pn])
+  }
+ 
+  # Reduce to just predictor variables
+  bd = bd[,predictors]
   
-  return(predgbm)
+  # Make prediction for each model type
+  pp = switch(
+    mt,
+    gam = {
+      require(mgcv)
+      as.numeric(predict(model,bd,type="response"))
+    },
+    lasso = {
+      require(glmnet)
+      bd_quad <- predict.make_quadratic(model$quad_obj, newdata = bd)
+      bd_sparse <- Matrix::sparse.model.matrix( ~. -1, bd_quad)
+      
+      xx = predict(model$lassomod,newx=bd_sparse,type="response",s="lambda.min")
+      # predict.glmnet excludes NA's...
+      
+      yy = rep(NA,nrow(bd))
+      I = apply(bd,1,function(x)!any(is.na(x)))
+      yy[I] = as.numeric(xx)
+      yy
+    },
+    maxent = {
+      require(dismo)
+      xx = predict(model,bd)
+      # maxent excludes NA's...
+      
+      yy = rep(NA,nrow(bd))
+      I = apply(bd,1,function(x)!any(is.na(x)))
+      yy[I] = as.numeric(xx)
+      yy
+    },
+    gbm = {
+      require(dismo)
+      require(gbm)
+      predict(model,bd,n.trees=model$gbm.call$best.trees,type="response")
+    },
+    rf = {
+      require(randomForest)
+      predict(model,bd,type="prob")[,"1"]
+    }
+  )
+  
+  return(pp)
 }
-
 ```
 
 
@@ -552,7 +570,7 @@ res = foreach(n=1:nrow(new_mods),.export=c("params",lsf.str())) %dopar% {
   df = base_data.aggs.df[[sc]]
 
   model = do.call(mod_fn,list(df=df,lines=lines,predictors=predictors))
-  preds = do.call(pred_fn,list(model=model,df=df,lines=lines,bd=bd,predictors=predictors))
+  preds = predict_model(model=model,bd=bd,predictors=predictors)
   
   saveRDS(list(scale=sc,split=sp,model_type=mm,lines=lines,model=model,predictions=preds,
                predictors=predictors),
@@ -564,6 +582,24 @@ res = foreach(n=1:nrow(new_mods),.export=c("params",lsf.str())) %dopar% {
 # Ensemble mean and performance statistics
 
 ```{r ensemble,eval=!file.exists("results/supplementary-s2-case-study.model_stats.RDS")}
+# For estimating predictor effects, calculate mean of each predictor and change into DF
+# This will be the mean over entire study area
+pred_means = do.call("data.frame",lapply(base_data[predictors],mean,na.rm=TRUE))
+pred_means = pred_means[rep(1,params$n.pts),]
+
+# Create data frames with one predictor changing linearly and others constant
+pred_dfs = lapply(
+  predictors,
+  function(n) {
+    xx = range(base_data[[n]],na.rm=TRUE)
+    xx = seq(xx[1],xx[2],length.out=params$n.pts)
+    df = pred_means
+    df[[n]] = xx
+    return(df)
+  }
+)
+names(pred_dfs) = predictors
+
 mm = unique(models_to_run[c("scale","split")])
 nn = 1:nrow(mm)
 names(nn) = paste0("scale_",mm$scale,".split_",mm$split)
@@ -577,14 +613,35 @@ model_stats = foreach(n=nn) %do% {
   MM = filter(models_to_run,scale==sc,split==sp)
   
   num_mods = nrow(MM)
+  
+  # Variables to hold predictions for each predictor, fixing other predictors
+  preds = lapply(pred_dfs,function(x) { 
+    xx = NA*x[,rep(1,num_mods)]
+    names(xx) = MM$model
+    return(xx)
+  })
 
   res = readRDS(MM$filename[1])
+
+  # For ensemble average
   ee = res$predictions
   names(ee) = "predensemble"
-  
+
+  # Make model 1 predictions
+  for (n in names(preds)) {
+    preds[[n]][[MM$model[1]]] = predict_model(res$model,pred_dfs[[n]],predictors)
+  }
+    
   for (ii in 2:num_mods) {
     res = readRDS(MM$filename[ii])
+    
+    # For ensemble average
     ee = ee + res$predictions
+    
+    # Make model ii predictions
+    for (n in names(preds)) {
+      preds[[n]][[MM$model[ii]]] = predict_model(res$model,pred_dfs[[n]],predictors)
+    }
   }
   
   ee = ee/num_mods
@@ -613,8 +670,15 @@ model_stats = foreach(n=nn) %do% {
   fit=df$pred
   obs=df$pred[df$obs==1]
   c.stat=ecospat::ecospat.boyce(fit,obs, PEplot = FALSE)
-
-  list(scale=sc,split=sp,auc=aa,threshold=th,accuracy=acc,c.stat.boyce=c.stat)
+  
+  # Add predictor variables and change names for predictor predictions
+  for (n in names(preds)) {
+    preds[[n]] = c(pred_dfs[[n]],preds[[n]])
+  }
+  names(preds) = paste0("preds.",names(preds))
+  
+  r = list(scale=sc,split=sp,auc=aa,threshold=th,accuracy=acc,c.stat.boyce=c.stat)
+  return(c(r,preds))
 }
 
 names(model_stats) = names(nn)
