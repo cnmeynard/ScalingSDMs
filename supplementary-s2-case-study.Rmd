@@ -540,7 +540,7 @@ predict_model = function(model,bd,predictors) {
 #### NOTES FOR RUNNING MODELS ####
 # When running models, it is best to knit script outside of RStudio as RStudio and %dopar%
 # have a tendency to not play nicely together. In this case, it is best to run R in a
-# terminal and execute the script with `rmarkdown::render("supplementary-s2-case-study.Rmd")
+# terminal and execute the script with `rmarkdown::render("supplementary-s2-case-study.Rmd")`
 
 # Get all environment variables
 ev=as.list(Sys.getenv())
