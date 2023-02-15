@@ -1,0 +1,1118 @@
+---
+title: "Supplementary Material S2: Case study for \"A theoretical framework for upscaling species distribution models\""
+author: Christine N. Meynard, Cyril Piou, David M. Kaplan
+
+output:
+  bookdown::pdf_document2:
+    df_print: kable
+    toc: true
+    toc_depth: 3
+    keep_tex: true
+
+always_allow_html: true
+urlcolor: blue
+linkcolor: blue
+
+##### Basic parameters for model #####
+params:
+  predictor.files: !r c(PC1="rawData/PC1.grd",PC2="rawData/PC2.grd")
+  occurrence.file: "rawData/surveyed.grd"
+  split.frac: 0.8
+  num.splits: 10
+  models: !r c(gam="gam",rf="rf",gbm="gbm",maxent="maxent",lasso="lasso")
+  gam_k: 4
+  scales: !r seq(1,20,2)
+  ts: !r format(Sys.time(),format="%Y%m%dT%H%M%S")
+  # For running code in parallel
+  ncpus: 4 # Only used if ncpus environmental variable not present
+  n.pts: 200 # Number of points to use when estimating effect of each predictor
+
+# These are LaTex settings to take care of floating figures/tables, line spacing, etc
+header-includes:
+  - \usepackage[nomarkers,tablesfirst]{endfloat}    
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{lineno}
+  - \linenumbers
+  - \usepackage{tocloft}
+  - \setlength{\cftsecnumwidth}{3em}
+  - \setlength{\cftsubsecnumwidth}{3em}
+  - \setlength{\cftsubsubsecnumwidth}{4em}
+---
+
+<!-- For Latex section, figure and table numbering -->
+\renewcommand\thesection{S2.\arabic{section}}
+\renewcommand\thefigure{S2.\arabic{figure}}
+\renewcommand\thetable{S2.\arabic{table}}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.pos = 'p') # Places figures on their own pages
+knitr::opts_chunk$set(out.width = '100%', dpi=300)
+
+# More memory for Java
+options(java.parameters = "-Xmx2g" )
+dir.create("results",showWarnings = FALSE)
+
+library(tidyverse)
+library(mgcv)
+library(stars)
+library(Matrix)
+library(dismo)
+library(gbm)
+library(glmnet)
+library(randomForest)
+library (ecospat)
+library(foreach)
+library(tmap)
+library(tmaptools)
+```
+Note that this pdf was generated using an R Markdown script that can be found in the github repository (see main text). Here you will find a simple summary of the aggregation and modelling stages for the desert locust case study, and some additional figures in the end, but in order to see the code you need to recover the rmarkdown file from github. Also note that if you run this on your personal computer, it will generate around 13GB of data.
+
+# Load base data
+
+Load the different source datasets (PC1, PC2, and occurrence grid at finest resolution).
+
+```{r loadbasedata,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+predictors = names(params$predictor.files)
+pred_stars = do.call("c",lapply(params$predictor.files,read_stars))
+names(pred_stars) = predictors
+
+occ_stars = read_stars(params$occurrence.file)
+names(occ_stars) = "occurrence"
+
+# Warp the occurrence data to the predictors
+base_data = st_warp(occ_stars,pred_stars)
+base_data = c(pred_stars,base_data)
+
+```
+
+## Upscaling (spatial aggregation)
+
+Here we will aggregate spatial data by grid cells, from the native 1 x 1 grid cell (no aggregation) to the largest resolution of 19 x 19 grid cells, by intervals of 2 grid cells: 1 x 1, 3 x 3, 5 x 5, etc. For occurrences, the output in the aggregate is the maximum value, so that for any number of presences, the larger aggregate receives a presence. For the environmental predictors (PC1 and PC2), the output at the larger aggregate is the average of the values of the individual grid cells. 
+
+```{r downscaling,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+# Function for doing aggregation
+# Based on GDAL methods in `st_warp`. This can do a limited number of aggregation
+# functions and it always seems to operate as if one chose `na.rm=TRUE`.
+aggregate_fact = function(r,fact,method,no_data_value=-999) {
+  if (length(fact)==1) fact = c(fact,fact)
+  cellsize = fact * c(st_dimensions(r)$x$delta,st_dimensions(r)$y$delta)
+  rr = lapply(names(r), function(n) {
+    st_warp(r[n],cellsize=cellsize,use_gdal=TRUE,no_data_value=no_data_value,method=method)
+    })
+  rr = do.call("c",rr)
+  names(rr) = names(r)
+  return(rr)
+}
+
+# Create aggregates
+scales = params$scales
+names(scales) = scales
+
+base_data.aggs = scales |>
+  lapply(FUN=function(fact) {
+    occ = aggregate_fact(base_data["occurrence"],fact=fact,method="max")
+    pp = aggregate_fact(base_data[predictors],fact=fact,method="average")
+    return(c(pp,occ))
+  })
+
+```
+
+## Create data frames
+
+This will just create the global dataframes that are required for modelling at each scale.
+
+```{r asdataframe,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+base_data.aggs.df = base_data.aggs |>
+  lapply(FUN=function(d) {
+    d = as.data.frame(d) # Convert to data frame
+    d[apply(d,1,FUN=function(x) !any(is.na(x))),] # remove NA's
+  })
+```
+
+
+## Pre-calculate splits of the data
+
+This will take the previously created global dataframes and generate the specified number of splits for each scale, so that a portion can be used for calibration purposes (80%), and the rest can be used for model validation (i.e. calculating classification rate success).
+
+```{r splits,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+# Create the set of all splits we need
+splits = expand.grid(scale=as.character(scales),split=1:params$num.splits,
+                     stringsAsFactors = FALSE)
+
+nrows_df = sapply(base_data.aggs.df,nrow)
+
+# Variables containing rows to include for each combination of scale and split iteration
+splits.lines = lapply(1:nrow(splits),function(n) 
+  sample(1:nrows_df[splits$scale[n]],round(nrows_df[splits$scale[n]]*params$split.frac),
+         replace=FALSE))
+```
+
+## Save base data
+
+This saves the objects externally so that the process can be restarted later from here if needed.
+
+```{r savebasedata,eval=!file.exists("results/supplementary-s2-case-study.base-data.RData")}
+ts = params$ts
+save(predictors,base_data,base_data.aggs,base_data.aggs.df,splits,splits.lines,ts,scales,
+     file="results/supplementary-s2-case-study.base-data.RData")
+```
+
+```{r load_base_data_from_rdata}
+load("results/supplementary-s2-case-study.base-data.RData")
+```
+
+
+# Create list of models to run
+
+This serves to create a list of output files. Also, if the files already exist (because the script was run before), it will allow saving some time by skipping later the generation of these files. 
+
+```{r models_to_run,eval=!file.exists("results/supplementary-s2-case-study.models_to_run.RDS")}
+# Create list of all models we will use
+models_to_run = expand.grid(scale=as.character(scales),split=1:params$num.splits,
+                   model=params$models,
+                   stringsAsFactors = FALSE)
+
+models_to_run$filename = 
+  paste0("results/supplementary-s2-case-study",
+         ".scale_",sprintf("%02d",as.integer(models_to_run$scale)),
+         ".split_",sprintf("%02d",models_to_run$split),
+         ".model_",models_to_run$model,
+         ".RDS")
+
+saveRDS(models_to_run,"results/supplementary-s2-case-study.models_to_run.RDS")
+```
+
+```{r load_models_to_run_find_new}
+models_to_run = readRDS("results/supplementary-s2-case-study.models_to_run.RDS")
+
+# Just a list of models that have not yet been run
+new_mods = models_to_run[!file.exists(models_to_run$filename),]
+```
+
+# Run models
+
+## Helper functions from Valavi paper
+
+Here we adapted some of the functions presented in the supplements of Valavi et al (2022) Ecological Monographs 92 (1): e01486. Most notably, here we used the library stars to replace the raster and other dependencies that will go unsupported soon. The functions that we recovered from Valavi involve optimizing model parameters for MAXENT, and transforming predictors into quadratic for the glmnet implementation of lasso. The other prediction functions (see next section) work quite differently in stars, so we did not use Valavi's version, though we did use the same model parameter options in general.
+
+```{r prediction_helper}
+# Notice that this script comes from Valavi et al 2022 in Ecological Monograph
+# It has a few *minor modifications and corrections* with respect to what appeared
+# in the paper.
+
+#' Orthogonal quadratic polynomials for glmnet
+#'
+#' A function to creat quadratic terms for glmnet functions i.e. lasso and ridge regression.
+#' The output is an object of make_quadratic that can be used to predict on rasters and data.frames
+#' for creating the quadratic terms.
+#'
+#' @param df a data.frame, typically the training data.
+#' @param cols the name or index of the columns to be transformed. If NULL, all the columns will be transformed.
+#' The factor columns won't be transfromed.
+#'
+#' @author Roozbeh Valavi
+#'
+#' @return an object of make_quadratic that can be used to predict on rasters and data.frames
+#' @export
+#'
+#' @examples
+make_quadratic <- function(df, cols = NULL, verbose = TRUE){
+  if(is.null(cols)){
+    cols <- colnames(df)
+  }
+  if(is.numeric(cols)){
+    cols <- colnames(df)[cols]
+  }
+  # remove the factors
+  if(any(sapply(df[,cols], is.factor))){
+    if(verbose){
+      message("The factor columns were removed form cols: ", cols[which(sapply(df[,cols], is.factor))])
+    }
+    cols <- cols[-which(sapply(df[,cols], is.factor))]
+  }
+  if(!all(is.element(cols, colnames(df)))){
+    stop("The cols should be the same as the column names.")
+  }
+  xbar <- apply(df[,cols], 2, mean)
+  x1 <- data.frame(mapply(`-`, df[,cols], xbar, SIMPLIFY = FALSE))
+  alpha <- colSums(x1 ^ 3) / colSums(x1 ^ 2)
+  # specify the output class
+  finalList <- list(names = cols, xbars = xbar, alphas = alpha)
+  class(finalList) <- c("make_quadratic")
+  return(finalList)
+}
+
+
+#' @export
+#' @method predict make_quadratic
+predict.make_quadratic <- function(object, newdata, ...){
+  if(!methods::is(object, "make_quadratic"))
+    stop("object should be a make_quadratic object.")
+  if(!all(object$names %in% names(newdata)))
+    stop("The newdata does not have the same names as the object.")
+  ncl <- object$names
+  if(methods::is(newdata, "Raster")){
+    for(i in ncl){
+      x1 <- newdata[[i]] - object$xbars[i]
+      x2 <- (x1 ^ 2) - (object$alphas[i] * x1)
+      if(raster::nlayers(newdata) > 1){
+        newdata <- newdata[[-which(names(newdata) == i)]]
+        newdata <- raster::stack(newdata, x1)
+      } else{
+        newdata <- x1
+      }
+      names(newdata)[raster::nlayers(newdata)] <- paste0(i, "_1")
+      newdata <- raster::stack(newdata, x2)
+      names(newdata)[raster::nlayers(newdata)] <- paste0(i, "_2")
+    }
+  } else if(methods::is(newdata, "data.frame")){
+    for(i in ncl){
+      x1 <- newdata[,i] - object$xbars[i]
+      x2 <- x1 ^ 2 - object$alphas[i] * x1
+      newdata <- newdata[,-which(names(newdata) == i),drop=FALSE]
+      newdata[,ncol(newdata) + 1] <- x1
+      names(newdata)[ncol(newdata)] <- paste0(i, "_1")
+      newdata[,ncol(newdata) + 1] <- x2
+      names(newdata)[ncol(newdata)] <- paste0(i, "_2")
+    }
+  } else stop("newdata should be a raster or a data.frame.")
+  return(newdata)
+}
+
+
+# function for simultaneous tuning maxent regularisation multiplier and features
+maxent_param <- function(data, y = "occ", k = 5, folds = NULL, filepath){
+  require(dismo)
+  require(caret)
+  require(precrec)
+  
+  names(data)[which(names(data) == y)] <- "occ" # DMK: I moved this line up for folds calculation
+  
+  if(is.null(folds)){
+    # generate balanced CV folds
+    folds <- caret::createFolds(y = as.factor(data$occ), k = k)
+  }
+  covars <- names(data)[which(names(data) != y)]
+  # regularisation multipliers
+  ms <- c(0.5, 1, 2, 3, 4)
+  grid <- expand.grid(
+    regmult = paste0("betamultiplier=", ms),
+    features = list(
+      c("noautofeature", "nothreshold"), # LQHP
+      c("noautofeature", "nothreshold", "noproduct"), # LQH
+      c("noautofeature", "nothreshold", "nohinge", "noproduct"), # LQ
+      c("noautofeature", "nothreshold", "nolinear", "noquadratic", "noproduct"), # H
+      c("noautofeature", "nothreshold", "noquadratic", "nohinge", "noproduct")), # L
+    stringsAsFactors = FALSE
+    )
+  AUCs <- c()
+  for(n in seq_along(grid[,1])){
+    full_pred <- data.frame()
+    for(i in seq_len(length(folds))){
+      trainSet <- unlist(folds[-i])
+      testSet <- unlist(folds[i])
+      if(inherits(try(
+        maxmod <- dismo::maxent(x = data[trainSet, covars],
+                                p = data$occ[trainSet],
+                                removeDuplicates = FALSE,
+                                path = filepath,
+                                args = as.character(unlist(grid[n, ]))
+        )
+      ), "try-error")){
+        next
+      }
+      modpred <- predict(maxmod, data[testSet, covars], args = "outputformat=cloglog")
+      pred_df <- data.frame(score = modpred, label = data$occ[testSet])
+      full_pred <- rbind(full_pred, pred_df)
+    }
+    AUCs[n] <- precrec::auc(precrec::evalmod(scores = full_pred$score, 
+                                             labels = full_pred$label))[1,4]
+  }
+  best_param <- as.character(unlist(grid[which.max(AUCs), ]))
+  return(best_param)
+}
+
+
+# for easy saving the parameters
+param_to_txt <- function(x){
+  x <- x[-(1:3)]
+  if(length(x) == 0){
+    features <- "LQHP"
+  } else if(all(c("noquadratic", "nohinge", "noproduct") %in% x)){
+    features <- "L"
+  } else if(all(c("nolinear", "noquadratic", "noproduct") %in% x)){
+    features <- "H"
+  } else if(all(c("nohinge", "noproduct") %in% x)){
+    features <- "LQ"
+  } else if("noproduct" == x){
+    features <- "LQH"
+  }
+  return(features)
+}
+
+```
+
+
+## Functions to fit models
+
+This section contains code to run the different models with the options we want them all to be run. As stated before, these follow the implementation in Valavi: use of weights to balance presences and absences (notice here we have real absences though, whereas Valavi was using background data); optimizing maxent parameters; using quadratic terms for lasso; using the downsampled version of random forests.  
+
+```{r modfuns}
+
+# One function per model type. All functions must have df, lines and predictors arguments.
+
+run_model_gam = function(df,lines,predictors,k=params$gam_k) {
+  moddata=df[lines,]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  # Create formula
+  ff = paste0("s(",predictors,",k=",k,")",collapse="+")
+  ff = as.formula(paste0("occurrence~",ff))
+
+  mod1 = mgcv::gam(ff, family="binomial", data=moddata, weights = w50)
+  
+  return(mod1)
+}
+
+run_model_lasso = function(df,lines,predictors) {
+  moddata=df[lines,]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  moddata=moddata[,c(predictors,"occurrence","w50")]
+
+  #Quadratic terms
+  # function to create quadratic terms for lasso and ridge
+  quad_obj <- make_quadratic(moddata, cols = predictors)
+
+  # this make two columns for each covariates used in the transformation
+  training_quad <- predict.make_quadratic(quad_obj, newdata = moddata[,predictors])
+
+  # convert the data.frames to sparse matrices
+  training_sparse <- Matrix::sparse.model.matrix(~. -1, training_quad)#requires library Matrix
+
+  #Fitting the lasso model:
+  lassomod <- glmnet::cv.glmnet(x = training_sparse,
+                                y = moddata$occurrence, family = "binomial",
+                                alpha = 1, weights = moddata$w50, standardize = TRUE)
+
+  mod = list(quad_obj=quad_obj,lassomod=lassomod)
+  class(mod) = "quad_lasso"
+  return(mod)
+}
+
+run_model_maxent = function(df,lines,predictors,
+                            filepath=tempfile("results/maxent.outputs.",tmpdir=".")) {
+  moddata=df[lines,c(predictors,"occurrence")]
+    
+  nfold = ifelse(sum(moddata$occurrence) < 10, 2, 5)
+  
+  moddata$occurrence = as.factor(moddata$occurrence)
+
+  param_optim = maxent_param(data = moddata, y="occurrence",
+                             k = nfold,
+                             filepath = filepath)
+
+  mod_maxent = dismo::maxent(x = moddata[,predictors],
+                             p = moddata$occurrence,
+                             removeDuplicates = FALSE,
+                             path = filepath,
+                             args = param_optim
+  )
+
+  gc()
+  
+  return(mod_maxent)
+}
+
+run_model_rf = function(df,lines,predictors) {
+  moddata=df[lines,c(predictors,"occurrence")]
+  moddata$occurrence = as.factor(moddata$occurrence)
+
+  samsize = table(moddata$occurrence)
+  n = names(samsize)
+  samsize = as.numeric(samsize)
+  names(samsize) = n
+  
+  #calibrate the RF model
+  mod_rf <- randomForest::randomForest(occurrence ~ ., 
+                         data = moddata,
+                         ntree = 1000,
+                         sampsize = samsize,
+                         replace = TRUE)
+
+  return(mod_rf)
+}
+
+run_model_gbm = function(df,lines,predictors) {
+  moddata=df[lines,c(predictors,"occurrence")]
+  
+  # Weights
+  oo = table(moddata$occurrence)
+  moddata$w50 = ifelse(moddata$occurrence==1,10,round(10*oo["1"]/oo["0"]))
+
+  mod_gbm = dismo::gbm.step(data = moddata,
+                            gbm.x = predictors,
+                            gbm.y = "occurrence", 
+                            family = "bernoulli",
+                            site.weights = moddata$w50,
+                            tree.complexity = 5,
+                            learning.rate = 0.001,
+                            n.trees = 50,
+                            n.folds = 4,
+                            max.trees = 10000,
+                            plot.main=FALSE) # DMK: I turned off automatic plotting...
+  
+  return(mod_gbm)
+}
+
+```
+
+
+## Functions to predict models
+
+These are just adapting the different predictors in the projection area so that we can predict with the models that were calibrated in the previous section.
+
+```{r predictfuns}
+predict_model = function(model,bd,predictors) {
+  # Determine model type based on class of model
+  mt = c(gam="gam",randomForest.formula="rf",gbm="gbm",MaxEnt="maxent",list="lasso",
+         quad_lasso="lasso")[class(model)[1]]
+  
+  # If stars object recall with data.frame, put in stars object and return
+  if (isa(bd,"stars")) {
+    require(stars)
+    pp = predict_model(model=model,bd=as.data.frame(bd),predictors=predictors)
+    pn = paste0("pred",mt)
+    bd[[pn]] = pp
+    return(bd[pn])
+  }
+ 
+  # Reduce to just predictor variables
+  bd = bd[,predictors]
+  
+  # Make prediction for each model type
+  pp = switch(
+    mt,
+    gam = {
+      require(mgcv)
+      as.numeric(predict(model,bd,type="response"))
+    },
+    lasso = {
+      require(glmnet)
+      bd_quad <- predict.make_quadratic(model$quad_obj, newdata = bd)
+      bd_sparse <- Matrix::sparse.model.matrix( ~. -1, bd_quad)
+      
+      xx = predict(model$lassomod,newx=bd_sparse,type="response",s="lambda.min")
+      # predict.glmnet excludes NA's...
+      
+      yy = rep(NA,nrow(bd))
+      I = apply(bd,1,function(x)!any(is.na(x)))
+      yy[I] = as.numeric(xx)
+      yy
+    },
+    maxent = {
+      require(dismo)
+      xx = predict(model,bd)
+      # maxent excludes NA's...
+      
+      yy = rep(NA,nrow(bd))
+      I = apply(bd,1,function(x)!any(is.na(x)))
+      yy[I] = as.numeric(xx)
+      yy
+    },
+    gbm = {
+      require(dismo)
+      require(gbm)
+      predict(model,bd,n.trees=model$gbm.call$best.trees,type="response")
+    },
+    rf = {
+      require(randomForest)
+      predict(model,bd,type="prob")[,"1"]
+    }
+  )
+  
+  return(pp)
+}
+```
+
+
+## Execute models
+
+Here we execute the previous models. The script is set to run in a cluster, but will work in any computer with several cores, as there is some parallelization of procedures.
+
+```{r exec_models,eval=nrow(new_mods)>0, warning=FALSE}
+#### NOTES FOR RUNNING MODELS ####
+# When running models, it is best to knit script outside of RStudio as RStudio and %dopar%
+# have a tendency to not play nicely together. In this case, it is best to run R in a
+# terminal and execute the script with `rmarkdown::render("supplementary-s2-case-study.Rmd")`
+
+# Get all environment variables
+ev=as.list(Sys.getenv())
+
+if (is.null(ev$NCPUS)) ncpus=params$ncpus else ncpus=ev$NCPUS
+
+# Create computing cluster
+library(foreach)
+library(doParallel)
+cl <- makeCluster(ncpus)
+registerDoParallel(cl)
+
+# Exec models
+res = foreach(n=1:nrow(new_mods),.export=c("params",lsf.str())) %dopar% {
+  sc = as.character(new_mods$scale[n])
+  sp = new_mods$split[n]
+  mm = new_mods$model[n]
+  fn = new_mods$filename[n]
+  
+  mod_fn = paste0("run_model_",mm)
+  pred_fn = paste0("predict_model_",mm)
+  
+  spn = which(splits$scale==sc & splits$split==sp)
+  lines = splits.lines[[spn]]
+  
+  bd = base_data.aggs[[sc]]
+  df = base_data.aggs.df[[sc]]
+
+  model = do.call(mod_fn,list(df=df,lines=lines,predictors=predictors))
+  preds = predict_model(model=model,bd=bd,predictors=predictors)
+  
+  saveRDS(list(scale=sc,split=sp,model_type=mm,lines=lines,model=model,predictions=preds,
+               predictors=predictors),
+          file=fn)
+  fn
+}
+```
+
+# Ensemble mean and performance statistics
+
+Here we calculate different performance statistics, especially around presence-absence classification rates. We also generate the necessary predictions to draw the functional responses for each model and for the ensemble (i.e. need the predictions for PC1 while PC2 remains constant, and vice versa). 
+
+```{r ensemble,eval=!file.exists("results/supplementary-s2-case-study.model_stats.RDS", warning=FALSE, message=FALSE)}
+# For estimating predictor effects, calculate mean of each predictor and change into DF
+# This will be the mean over entire study area
+pred_means = do.call("data.frame",lapply(base_data[predictors],mean,na.rm=TRUE))
+pred_means = pred_means[rep(1,params$n.pts),]
+
+# Create data frames with one predictor changing linearly and others constant
+pred_dfs = lapply(
+  predictors,
+  function(n) {
+    xx = range(base_data[[n]],na.rm=TRUE)
+    xx = seq(xx[1],xx[2],length.out=params$n.pts)
+    df = pred_means
+    df[[n]] = xx
+    return(df)
+  }
+)
+names(pred_dfs) = predictors
+
+mm = unique(models_to_run[c("scale","split")])
+nn = 1:nrow(mm)
+names(nn) = paste0("scale_",mm$scale,".split_",mm$split)
+model_stats = foreach(n=nn) %do% {
+  sc = as.character(mm$scale[n])
+  sp = mm$split[n]
+  
+  N = which(splits$scale == sc & splits$split == sp)
+  lines = splits.lines[[N]]
+  
+  MM = filter(models_to_run,scale==sc,split==sp)
+  
+  num_mods = nrow(MM)
+  
+  # Variables to hold predictions for each predictor, fixing other predictors
+  preds = lapply(pred_dfs,function(x) { 
+    xx = NA*x[,rep(1,num_mods)]
+    names(xx) = MM$model
+    return(xx)
+  })
+
+  res = readRDS(MM$filename[1])
+
+  # For ensemble average
+  ee = res$predictions
+  names(ee) = "predensemble"
+
+  # Make model 1 predictions
+  for (n in names(preds)) {
+    preds[[n]][[MM$model[1]]] = predict_model(res$model,pred_dfs[[n]],predictors)
+  }
+    
+  for (ii in 2:num_mods) {
+    res = readRDS(MM$filename[ii])
+    
+    # For ensemble average
+    ee = ee + res$predictions
+    
+    # Make model ii predictions
+    for (n in names(preds)) {
+      preds[[n]][[MM$model[ii]]] = predict_model(res$model,pred_dfs[[n]],predictors)
+    }
+  }
+  
+  ee = ee/num_mods
+  
+  nfn = gsub("model_.*.RDS$","model_ensemble.RDS",MM$filename[1])
+  res$model = "ENSEMBLE AVERAGE"
+  res$predictions = ee
+  saveRDS(res,nfn)
+  
+  # Stats
+  df = base_data.aggs.df[[sc]][-lines,"occurrence",drop=FALSE]
+  names(df) = "obs"
+  
+  I = apply(as.data.frame(base_data.aggs[[sc]]),1,FUN=function(x) !any(is.na(x)))
+  df$pred = ee[[1]][I][-lines]
+  
+  # Add ID column
+  df$id = 1:nrow(df)
+  
+  # Reorder as needed by PresenceAbsence
+  df = df[,c("id","obs","pred")]
+    
+  aa = PresenceAbsence::auc(df)
+  th = PresenceAbsence::optimal.thresholds(df, opt.methods=3)
+  acc = PresenceAbsence::presence.absence.accuracy(df,th[[2]])
+  fit=df$pred
+  obs=df$pred[df$obs==1]
+  c.stat=ecospat::ecospat.boyce(fit,obs, PEplot = FALSE)
+  
+  # Add predictor variables and change names for predictor predictions
+  for (n in names(preds)) {
+    preds[[n]] = c(pred_dfs[[n]],preds[[n]])
+  }
+  names(preds) = paste0("preds.",names(preds))
+  
+  r = list(scale=sc,split=sp,auc=aa,threshold=th,accuracy=acc,c.stat.boyce=c.stat)
+  return(c(r,preds))
+}
+
+names(model_stats) = names(nn)
+
+saveRDS(model_stats,"results/supplementary-s2-case-study.model_stats.RDS")
+```
+
+```{r load_saved_stats}
+model_stats = readRDS("results/supplementary-s2-case-study.model_stats.RDS")
+```
+
+After all this, we just need some plots to summarize the results. First recover all the performance indices of interest per scale in a more workable format.
+```{r recover_performance_by_scale, warning=FALSE, message=FALSE, echo=FALSE, error=FALSE}
+#It will be easier to reorganize in a single table the results regarding model performance, so that I can plot by scale
+perf.results = as.data.frame(matrix(data=NA, nrow=length(model_stats), ncol=(3+ncol(model_stats[[1]]["accuracy"]$accuracy))))
+colnames(perf.results)= c("split", "scale", names(model_stats[[1]]["accuracy"]$accuracy), "boyce")
+for (i in 1:length(model_stats)){
+  perf.results[i,"scale"]=model_stats[[i]]$scale
+  perf.results[i,"split"]=model_stats[[i]]$split
+  perf.results[i, names(model_stats[[i]]["accuracy"]$accuracy)]=model_stats[[i]]["accuracy"]$accuracy
+  perf.results[i,"boyce"]=model_stats[[i]]["c.stat.boyce"]$c.stat.boyce$cor
+}
+perf.results$scale=as.numeric(perf.results$scale)
+#Add TSS, which is sensitivity + specificity -1
+perf.results$TSS = perf.results$sensitivity+perf.results$specificity-1
+```
+Then do the plot of different presence-absence performance indices per aggregation scale.
+```{r performance_figure, fig.width=6,fig.asp=0.9,warning=FALSE, message=FALSE}
+#Plotting different performance indices by scale:
+par(mfrow=c(2,2), mar=c(4.5, 5, 1, 2))
+#AUC as a function of the aggregation scale:
+boxplot(perf.results$AUC~perf.results$scale, xlab="", ylab="AUC", cex.lab=1.5)
+
+#We can do the same with any of the other classification rate metrics
+boxplot(perf.results$TSS~perf.results$scale, xlab="", ylab="TSS", cex.lab=1.5)
+
+#PCC:
+boxplot(perf.results$PCC~perf.results$scale, xlab="Aggregation scale", ylab="PCC", cex.lab=1.5)
+
+#Kappa
+boxplot(perf.results$Kappa~perf.results$scale, xlab="Aggregation scale", ylab="Kappa", cex.lab=1.5)
+
+
+```
+
+
+```{r distribution_figure, fig.width=6,fig.asp=0.9, warning=FALSE}
+#Plotting the study area with the distributions aggregated at different scales:
+#Importing the study area contours (so that the maps are better):
+StArea = st_read (dsn = "./rawData", layer = "StArea")
+p1 = tm_shape(StArea) + tm_fill(col="#FFFFCC")
+p.sc1 = tm_shape(base_data.aggs[[1]]) +
+  tm_raster(col="occurrence",n=2, palette="Blues", legend.show = FALSE) +
+  tm_layout(title="Scale = 1 x 1")
+
+p.sc5 = tm_shape(base_data.aggs[[3]]) +
+  tm_raster(col="occurrence",n=2, palette="Blues", legend.show = FALSE) +
+  tm_layout(title="Scale = 5 x 5")
+
+p.sc11 = tm_shape(base_data.aggs[[6]]) +
+  tm_raster(col="occurrence",n=2, palette="Blues", legend.show = FALSE) +
+  tm_layout(title="Scale = 11 x 11")
+
+p.sc19 = tm_shape(base_data.aggs[[10]]) +
+  tm_raster(col="occurrence",n=2, palette="Blues", legend.show = FALSE) +
+  tm_layout(title="Scale = 19 x 19")
+
+psc1 = p1 + p.sc1
+psc5 = p1 + p.sc5
+psc11 = p1 + p.sc11
+psc19 = p1 + p.sc19
+
+#windows(width = 4000, height=4000)
+tmap_arrange(psc1, psc5, psc11, psc19, ncol = 2)
+```
+Now in order to make the plots for response curves, we need to recover the predictions of the ensemble and of the different models when PC1 varies and PC2 remain constant, and vice versa. Also, because when we previously extracted the range of PC1 and PC2 values we did so from all of the study area, now we need to restrict it to the range that was actually surveyed. We will actually limit it to the 95% central values to avoid extreme values. 
+
+```{r data_for_response_curves_ensemble}
+
+#Extract 95% of central values of PC1 and PC2 in surveyed grid cells only
+#Keep these values in store for later; they will be usedto limit the functional response plots:
+pc1.central = as.numeric(quantile(base_data.aggs.df[[1]]$PC1, probs=c(0.025, 0.975)))
+pc2.central= as.numeric(quantile(base_data.aggs.df[[1]]$PC2, probs=c(0.025, 0.975)))
+
+
+#Now in order to draw the response curves, we need to recover the ensemble predictions for the PC1 and PC2 range of values, which are in different elements of the result lists
+
+#First for the ensemble, compile in one place the data of PC1, PC2, and predictions:
+data.for.curves = data.frame(scale=NA, split=NA, pc1 = NA, pc2=NA, ensemb.pc1=NA, ensemb.pc2=NA)
+for (i in 1:length(model_stats)){#10 iterations, for 10 different resolution levels
+  t= model_stats[[i]]$preds.PC1#predictions of varying PC1 while the rest remains constant
+  s = t[[3]]#this is the prediction of gam 
+  for (k in 4:7){#these are predictions for the other models 
+    s=s+t[[k]]#sums all predictions
+  }
+  ens.pc1 = s/5#divides by the number of models to calculate mean predictions
+  
+  t= model_stats[[i]]$preds.PC2
+  s = t[[3]]
+  for (k in 4:7){
+    s=s+t[[k]]
+  }
+  ens.pc2 = s/5
+  
+  data.for.curves = rbind(data.for.curves, data.frame(scale=model_stats[[i]]$scale, 
+                                     split=model_stats[[i]]$split, pc1 = model_stats[[i]]$preds.PC1$PC1, 
+                                     pc2=model_stats[[i]]$preds.PC2$PC2, ensemb.pc1=ens.pc1, 
+                                     ensemb.pc2=ens.pc2))
+}
+data.for.curves=data.for.curves[-1,]
+
+#Now we calculate mean, sd, and confidence intervals for the curves: 
+scales=unique(data.for.curves$scale)
+nsplits=unique(data.for.curves$split)
+
+mean.ensemb=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.ensembles=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.for.curves, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,-2]
+  for(t in 2:length(nsplits)){
+    a=subset(data.for.curves, scale==scales[i]&split==nsplits[t])
+    a=a[, c("ensemb.pc1", "ensemb.pc2")]
+    colnames(a)= paste("ens", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.ensembles[[i]]=byscale
+}
+```
+
+And draw the response curves:
+```{r figure_ensemble_response_curve, fig.width=6,fig.asp=1.5}
+#And now I can use these data frames to draw the figures
+#First just the ensemble compared to GAMs, to have a simple idea. 
+par(mfrow=c(2,1))
+plot(mean.ensembles[[1]]$pc1, mean.ensembles[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main ="ENSEMBLE")
+polygon(c(mean.ensembles[[1]]$pc1, rev(mean.ensembles[[1]]$pc1)), c(mean.ensembles[[1]]$pc1.ci.inf, rev(mean.ensembles[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+polygon(c(mean.ensembles[[6]]$pc1, rev(mean.ensembles[[6]]$pc1)), c(mean.ensembles[[6]]$pc1.ci.inf, rev(mean.ensembles[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.ensembles[[10]]$pc1, rev(mean.ensembles[[10]]$pc1)), c(mean.ensembles[[10]]$pc1.ci.inf, rev(mean.ensembles[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+
+lines(mean.ensembles[[1]]$pc1, mean.ensembles[[1]]$pc1.mean, type="l", col="black")
+lines(mean.ensembles[[6]]$pc1, mean.ensembles[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.ensembles[[10]]$pc1, mean.ensembles[[10]]$pc1.mean, type="l", col="seagreen3")
+
+
+plot(mean.ensembles[[1]]$pc2, mean.ensembles[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central)
+polygon(c(mean.ensembles[[1]]$pc2, rev(mean.ensembles[[1]]$pc2)), c(mean.ensembles[[1]]$pc2.ci.inf, rev(mean.ensembles[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+polygon(c(mean.ensembles[[6]]$pc2, rev(mean.ensembles[[6]]$pc2)), c(mean.ensembles[[6]]$pc2.ci.inf, rev(mean.ensembles[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.ensembles[[10]]$pc2, rev(mean.ensembles[[10]]$pc2)), c(mean.ensembles[[10]]$pc2.ci.inf, rev(mean.ensembles[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+
+lines(mean.ensembles[[1]]$pc2, mean.ensembles[[1]]$pc2.mean, type="l", col="black")
+lines(mean.ensembles[[6]]$pc2, mean.ensembles[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.ensembles[[10]]$pc2, mean.ensembles[[10]]$pc2.mean, type="l", col="seagreen3")
+legend(0.4,1.02, c("1x1", "11x11", "19x19"), col=c("black", "yellow", "seagreen3"), lty=1)
+
+```
+We would like to see how the GAM response curves look like (probably smoother than the ensemble); and since we are at it, looking at individual response curves for each type of model would also be interesting, so we'll recover the data for each model below. 
+
+```{r data_for_response_curves_by_model}
+
+data.by.model= data.frame(scale=NA, split=NA, pc1 = NA, pc2=NA, gam.pc1=NA,rf.pc1=NA,gbm.pc1=NA,maxent.pc1=NA,lasso.pc1=NA,
+                          gam.pc2=NA, rf.pc2=NA,gbm.pc2=NA,maxent.pc2=NA,lasso.pc2=NA)
+for (i in 1:length(model_stats)){#10 iterations, for 10 different resolution levels
+  data.by.model = rbind(data.by.model, data.frame(scale=model_stats[[i]]$scale, 
+                                                      split=model_stats[[i]]$split, pc1 = model_stats[[i]]$preds.PC1$PC1, 
+                                                      pc2=model_stats[[i]]$preds.PC2$PC2, gam.pc1=model_stats[[i]]$preds.PC1$gam, 
+                                                  rf.pc1=model_stats[[i]]$preds.PC1$rf,gbm.pc1=model_stats[[i]]$preds.PC1$gbm,                                                  maxent.pc1=model_stats[[i]]$preds.PC1$maxent,lasso.pc1=model_stats[[i]]$preds.PC1$lasso,
+                                                  gam.pc2=model_stats[[i]]$preds.PC2$gam, 
+                                                  rf.pc2=model_stats[[i]]$preds.PC2$rf,gbm.pc2=model_stats[[i]]$preds.PC2$gbm,                                                  maxent.pc2=model_stats[[i]]$preds.PC2$maxent,lasso.pc2=model_stats[[i]]$preds.PC2$lasso))
+}
+data.by.model=data.by.model[-1,]
+
+#All models are mixed in above, so I can recover for each one now. 
+# GAM:
+mean.gam=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.gams=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.by.model, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,c(1, 3:5, 10)]
+  colnames(byscale)[4:5]=c("gam1.pc1", "gam1.pc2")
+  for(t in 2:length(nsplits)){
+    a=subset(data.by.model, scale==scales[i]&split==nsplits[t])
+    a=a[, c("gam.pc1", "gam.pc2")]
+    colnames(a)= paste("gam", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.gams[[i]]=byscale
+}
+
+
+#Random Forests
+mean.rf=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.rfs=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.by.model, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,c(1, 3:5, 10)]
+  colnames(byscale)[4:5]=c("rf1.pc1", "rf1.pc2")
+  for(t in 2:length(nsplits)){
+    a=subset(data.by.model, scale==scales[i]&split==nsplits[t])
+    a=a[, c("rf.pc1", "rf.pc2")]
+    colnames(a)= paste("rf", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.rfs[[i]]=byscale
+}
+
+#Boosted regressions:
+mean.gbm=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.gbms=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.by.model, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,c(1, 3:5, 10)]
+  colnames(byscale)[4:5]=c("gbm1.pc1", "gbm1.pc2")
+  for(t in 2:length(nsplits)){
+    a=subset(data.by.model, scale==scales[i]&split==nsplits[t])
+    a=a[, c("gbm.pc1", "gbm.pc2")]
+    colnames(a)= paste("gbm", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.gbms[[i]]=byscale
+}
+
+#MAXENT
+mean.maxent=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.maxents=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.by.model, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,c(1, 3:5, 10)]
+  colnames(byscale)[4:5]=c("maxent1.pc1", "maxent1.pc2")
+  for(t in 2:length(nsplits)){
+    a=subset(data.by.model, scale==scales[i]&split==nsplits[t])
+    a=a[, c("maxent.pc1", "maxent.pc2")]
+    colnames(a)= paste("maxent", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.maxents[[i]]=byscale
+}
+
+#Lasso
+mean.lasso=as.data.frame(matrix(data=NA, ncol=ncol(data.for.curves)))
+mean.lassos=list()
+for (i in 1:length(scales)){
+  byscale=subset(data.by.model, scale==scales[i]&split==nsplits[1])
+  byscale=byscale[,c(1, 3:5, 10)]
+  colnames(byscale)[4:5]=c("lasso1.pc1", "lasso1.pc2")
+  for(t in 2:length(nsplits)){
+    a=subset(data.by.model, scale==scales[i]&split==nsplits[t])
+    a=a[, c("lasso.pc1", "lasso.pc2")]
+    colnames(a)= paste("lasso", t, c(".pc1", ".pc2"), sep="")
+    byscale = cbind(byscale, a)
+  }
+  byscale=byscale[-1,]
+  byscale$pc1.mean=rowMeans(byscale[,grep(".pc1", colnames(byscale))])
+  byscale$pc1.sd=apply(byscale[,grep(".pc1", colnames(byscale))], 1, sd)
+  byscale$pc1.ci.inf=byscale$pc1.mean-1.96*byscale$pc1.sd
+  byscale$pc1.ci.sup=byscale$pc1.mean+1.96*byscale$pc1.sd
+  byscale$pc2.mean=rowMeans(byscale[,grep(".pc2", colnames(byscale))])
+  byscale$pc2.sd=apply(byscale[,grep(".pc2", colnames(byscale))], 1, sd)
+  byscale$pc2.ci.inf=byscale$pc2.mean-1.96*byscale$pc2.sd
+  byscale$pc2.ci.sup=byscale$pc2.mean+1.96*byscale$pc2.sd
+  mean.lassos[[i]]=byscale
+}
+```
+And draw a single figure with all response curves for each model type + the ensemble.Notice that Random Forests produce a lot of variability. This is what is driving the ensemble's ups and downs.
+```{r figure_for_response_curves_by_model, fig.width=6, fig.asp=2.5}
+par(mfrow=c(6,2), mar=c(4, 3, 1.2, 1), mgp=c(2, 0.5, 0))
+
+plot(mean.ensembles[[1]]$pc1, mean.ensembles[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="ENSEMBLE")
+polygon(c(mean.ensembles[[1]]$pc1, rev(mean.ensembles[[1]]$pc1)), c(mean.ensembles[[1]]$pc1.ci.inf, rev(mean.ensembles[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+polygon(c(mean.ensembles[[6]]$pc1, rev(mean.ensembles[[6]]$pc1)), c(mean.ensembles[[6]]$pc1.ci.inf, rev(mean.ensembles[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.ensembles[[10]]$pc1, rev(mean.ensembles[[10]]$pc1)), c(mean.ensembles[[10]]$pc1.ci.inf, rev(mean.ensembles[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+
+lines(mean.ensembles[[1]]$pc1, mean.ensembles[[1]]$pc1.mean, type="l", col="black")
+lines(mean.ensembles[[6]]$pc1, mean.ensembles[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.ensembles[[10]]$pc1, mean.ensembles[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.ensembles[[1]]$pc2, mean.ensembles[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="ENSEMBLE")
+polygon(c(mean.ensembles[[1]]$pc2, rev(mean.ensembles[[1]]$pc2)), c(mean.ensembles[[1]]$pc2.ci.inf, rev(mean.ensembles[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+polygon(c(mean.ensembles[[6]]$pc2, rev(mean.ensembles[[6]]$pc2)), c(mean.ensembles[[6]]$pc2.ci.inf, rev(mean.ensembles[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.ensembles[[10]]$pc2, rev(mean.ensembles[[10]]$pc2)), c(mean.ensembles[[10]]$pc2.ci.inf, rev(mean.ensembles[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+
+lines(mean.ensembles[[1]]$pc2, mean.ensembles[[1]]$pc2.mean, type="l", col="black")
+lines(mean.ensembles[[6]]$pc2, mean.ensembles[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.ensembles[[10]]$pc2, mean.ensembles[[10]]$pc2.mean, type="l", col="seagreen3")
+
+plot(mean.gams[[1]]$pc1, mean.gams[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="GAM")
+polygon(c(mean.gams[[10]]$pc1, rev(mean.gams[[10]]$pc1)), c(mean.gams[[10]]$pc1.ci.inf, rev(mean.gams[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.gams[[6]]$pc1, rev(mean.gams[[6]]$pc1)), c(mean.gams[[6]]$pc1.ci.inf, rev(mean.gams[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.gams[[1]]$pc1, rev(mean.gams[[1]]$pc1)), c(mean.gams[[1]]$pc1.ci.inf, rev(mean.gams[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.gams[[1]]$pc1, mean.gams[[1]]$pc1.mean, type="l", col="black")
+lines(mean.gams[[6]]$pc1, mean.gams[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.gams[[10]]$pc1, mean.gams[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.gams[[1]]$pc2, mean.gams[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="GAM")
+polygon(c(mean.gams[[10]]$pc2, rev(mean.gams[[10]]$pc2)), c(mean.gams[[10]]$pc2.ci.inf, rev(mean.gams[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.gams[[6]]$pc2, rev(mean.gams[[6]]$pc2)), c(mean.gams[[6]]$pc2.ci.inf, rev(mean.gams[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.gams[[1]]$pc2, rev(mean.gams[[1]]$pc2)), c(mean.gams[[1]]$pc2.ci.inf, rev(mean.gams[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.gams[[1]]$pc2, mean.gams[[1]]$pc2.mean, type="l", col="black")
+lines(mean.gams[[6]]$pc2, mean.gams[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.gams[[10]]$pc2, mean.gams[[10]]$pc2.mean, type="l", col="seagreen3")
+
+legend(0.8,1.02, c("1x1", "11x11", "19x19"), col=c("black", "yellow", "seagreen3"), lty=1)
+
+plot(mean.gbms[[1]]$pc1, mean.gbms[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="GBM")
+polygon(c(mean.gbms[[10]]$pc1, rev(mean.gbms[[10]]$pc1)), c(mean.gbms[[10]]$pc1.ci.inf, rev(mean.gbms[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.gbms[[6]]$pc1, rev(mean.gbms[[6]]$pc1)), c(mean.gbms[[6]]$pc1.ci.inf, rev(mean.gbms[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.gbms[[1]]$pc1, rev(mean.gbms[[1]]$pc1)), c(mean.gbms[[1]]$pc1.ci.inf, rev(mean.gbms[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.gbms[[1]]$pc1, mean.gbms[[1]]$pc1.mean, type="l", col="black")
+lines(mean.gbms[[6]]$pc1, mean.gbms[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.gbms[[10]]$pc1, mean.gbms[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.gbms[[1]]$pc2, mean.gbms[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="GBM")
+polygon(c(mean.gbms[[10]]$pc2, rev(mean.gbms[[10]]$pc2)), c(mean.gbms[[10]]$pc2.ci.inf, rev(mean.gbms[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.gbms[[6]]$pc2, rev(mean.gbms[[6]]$pc2)), c(mean.gbms[[6]]$pc2.ci.inf, rev(mean.gbms[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.gbms[[1]]$pc2, rev(mean.gbms[[1]]$pc2)), c(mean.gbms[[1]]$pc2.ci.inf, rev(mean.gbms[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.gbms[[1]]$pc2, mean.gbms[[1]]$pc2.mean, type="l", col="black")
+lines(mean.gbms[[6]]$pc2, mean.gbms[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.gbms[[10]]$pc2, mean.gbms[[10]]$pc2.mean, type="l", col="seagreen3")
+
+plot(mean.lassos[[1]]$pc1, mean.lassos[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="LASSO")
+polygon(c(mean.lassos[[10]]$pc1, rev(mean.lassos[[10]]$pc1)), c(mean.lassos[[10]]$pc1.ci.inf, rev(mean.lassos[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.lassos[[6]]$pc1, rev(mean.lassos[[6]]$pc1)), c(mean.lassos[[6]]$pc1.ci.inf, rev(mean.lassos[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.lassos[[1]]$pc1, rev(mean.lassos[[1]]$pc1)), c(mean.lassos[[1]]$pc1.ci.inf, rev(mean.lassos[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.lassos[[1]]$pc1, mean.lassos[[1]]$pc1.mean, type="l", col="black")
+lines(mean.lassos[[6]]$pc1, mean.lassos[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.lassos[[10]]$pc1, mean.lassos[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.lassos[[1]]$pc2, mean.lassos[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="LASSO")
+polygon(c(mean.lassos[[10]]$pc2, rev(mean.lassos[[10]]$pc2)), c(mean.lassos[[10]]$pc2.ci.inf, rev(mean.lassos[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.lassos[[6]]$pc2, rev(mean.lassos[[6]]$pc2)), c(mean.lassos[[6]]$pc2.ci.inf, rev(mean.lassos[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.lassos[[1]]$pc2, rev(mean.lassos[[1]]$pc2)), c(mean.lassos[[1]]$pc2.ci.inf, rev(mean.lassos[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.lassos[[1]]$pc2, mean.lassos[[1]]$pc2.mean, type="l", col="black")
+lines(mean.lassos[[6]]$pc2, mean.lassos[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.lassos[[10]]$pc2, mean.lassos[[10]]$pc2.mean, type="l", col="seagreen3")
+
+plot(mean.maxents[[1]]$pc1, mean.maxents[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="MAXENT")
+polygon(c(mean.maxents[[10]]$pc1, rev(mean.maxents[[10]]$pc1)), c(mean.maxents[[10]]$pc1.ci.inf, rev(mean.maxents[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.maxents[[6]]$pc1, rev(mean.maxents[[6]]$pc1)), c(mean.maxents[[6]]$pc1.ci.inf, rev(mean.maxents[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.maxents[[1]]$pc1, rev(mean.maxents[[1]]$pc1)), c(mean.maxents[[1]]$pc1.ci.inf, rev(mean.maxents[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.maxents[[1]]$pc1, mean.maxents[[1]]$pc1.mean, type="l", col="black")
+lines(mean.maxents[[6]]$pc1, mean.maxents[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.maxents[[10]]$pc1, mean.maxents[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.maxents[[1]]$pc2, mean.maxents[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="MAXENT")
+polygon(c(mean.maxents[[10]]$pc2, rev(mean.maxents[[10]]$pc2)), c(mean.maxents[[10]]$pc2.ci.inf, rev(mean.maxents[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.maxents[[6]]$pc2, rev(mean.maxents[[6]]$pc2)), c(mean.maxents[[6]]$pc2.ci.inf, rev(mean.maxents[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.maxents[[1]]$pc2, rev(mean.maxents[[1]]$pc2)), c(mean.maxents[[1]]$pc2.ci.inf, rev(mean.maxents[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.maxents[[1]]$pc2, mean.maxents[[1]]$pc2.mean, type="l", col="black")
+lines(mean.maxents[[6]]$pc2, mean.maxents[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.maxents[[10]]$pc2, mean.maxents[[10]]$pc2.mean, type="l", col="seagreen3")
+
+plot(mean.rfs[[1]]$pc1, mean.rfs[[1]]$pc1.mean, type="l", col="black", ylab="", xlab="PC1", ylim=c(0,1), xlim=pc1.central, main="Random Forest")
+polygon(c(mean.rfs[[10]]$pc1, rev(mean.rfs[[10]]$pc1)), c(mean.rfs[[10]]$pc1.ci.inf, rev(mean.rfs[[10]]$pc1.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.rfs[[6]]$pc1, rev(mean.rfs[[6]]$pc1)), c(mean.rfs[[6]]$pc1.ci.inf, rev(mean.rfs[[6]]$pc1.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.rfs[[1]]$pc1, rev(mean.rfs[[1]]$pc1)), c(mean.rfs[[1]]$pc1.ci.inf, rev(mean.rfs[[1]]$pc1.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.rfs[[1]]$pc1, mean.rfs[[1]]$pc1.mean, type="l", col="black")
+lines(mean.rfs[[6]]$pc1, mean.rfs[[6]]$pc1.mean, type="l", col="yellow")
+lines(mean.rfs[[10]]$pc1, mean.rfs[[10]]$pc1.mean, type="l", col="seagreen3")
+
+plot(mean.rfs[[1]]$pc2, mean.rfs[[1]]$pc2.mean, type="l", col="black", ylab="", xlab="PC2", ylim=c(0,1), xlim=pc2.central, main="Random Forest")
+polygon(c(mean.rfs[[10]]$pc2, rev(mean.rfs[[10]]$pc2)), c(mean.rfs[[10]]$pc2.ci.inf, rev(mean.rfs[[10]]$pc2.ci.sup)), border=FALSE, col="seagreen2")
+polygon(c(mean.rfs[[6]]$pc2, rev(mean.rfs[[6]]$pc2)), c(mean.rfs[[6]]$pc2.ci.inf, rev(mean.rfs[[6]]$pc2.ci.sup)), border=FALSE, col="yellow3")
+polygon(c(mean.rfs[[1]]$pc2, rev(mean.rfs[[1]]$pc2)), c(mean.rfs[[1]]$pc2.ci.inf, rev(mean.rfs[[1]]$pc2.ci.sup)), border=FALSE, col="grey")
+
+lines(mean.rfs[[1]]$pc2, mean.rfs[[1]]$pc2.mean, type="l", col="black")
+lines(mean.rfs[[6]]$pc2, mean.rfs[[6]]$pc2.mean, type="l", col="yellow")
+lines(mean.rfs[[10]]$pc2, mean.rfs[[10]]$pc2.mean, type="l", col="seagreen3")
+
+
+``` 
